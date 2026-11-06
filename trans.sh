@@ -850,8 +850,10 @@ is_staticv4() {
 }
 
 is_staticv6() {
+    # 私网静态配置的保留状态不代表公网可用。
     if ! is_ipv6_has_internet; then
-        return 1
+        get_netconf_to preserve_static_ipv6
+        [ "$preserve_static_ipv6" = 1 ] || return 1
     fi
 
     if ! is_slaac && ! is_dhcpv6; then
@@ -1059,6 +1061,11 @@ should_add_ipv4_static_dns() {
 }
 
 should_add_ipv6_static_dns() {
+    # 仅保留私网地址时，不为它生成互联网 DNS 配置。
+    if ! is_ipv6_has_internet; then
+        return $FALSE
+    fi
+
     # 无 ip 直接返回 FALSE
     if ! { is_slaac || is_dhcpv6 || is_staticv6; }; then
         return $FALSE
@@ -9107,6 +9114,8 @@ fi
 
 # shellcheck disable=SC2154
 if [ "$hold" = 1 ]; then
+    . /lib/debian-installer/boot-trace.sh 2>/dev/null || true
+    trace_stage TRANS_HOLD "trans.sh hold 1 active; pausing" || true
     if is_run_from_locald; then
         info "hold"
         exit

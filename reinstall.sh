@@ -6,9 +6,9 @@
 # alpine 默认没有 bash，因此 shebang 用 sh，再 exec 切换到 bash
 
 set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
-confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
-# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
+confhome=https://raw.githubusercontent.com/121909/reinstall/main
+confhome_cn=https://gh-proxy.com/https://raw.githubusercontent.com/121909/reinstall/main
+# confhome_cn=https://fastly.jsdelivr.net/gh/121909/reinstall@main
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0005
@@ -2809,7 +2809,7 @@ prompt_username() {
     warn false "设置用户名，不填写则使用 $default_username"
     warn false "Set username, leave blank will use $default_username"
 
-    IFS= read -r -p "Username: " username
+    IFS= read -r -p "Username: " username || username=""
     username="$(printf "%s" "$username" | trim)"
 
     if [ -z "$username" ]; then
@@ -2826,7 +2826,7 @@ prompt_password() {
     warn false "Set password, leave blank will use a random password"
 
     while true; do
-        IFS= read -r -p "Password: " password
+        IFS= read -r -p "Password: " password || password=""
         if [ -n "$password" ]; then
             IFS= read -r -p "Retype password: " password_confirm
             if [ "$password" = "$password_confirm" ]; then
@@ -3544,45 +3544,27 @@ install_grub_win() {
         # bios
         info install grub for bios
 
-        # bootmgr 加载 g2ldr 有大小限制
-        # 超过大小会报错 0xc000007b
-        # 解决方法1 g2ldr.mbr + g2ldr
-        # 解决方法2 生成少于64K的 g2ldr + 动态模块
-        if false; then
-            # g2ldr.mbr
-            # 部分国内机无法访问 ftp.cn.debian.org
-            is_in_china && host=mirror.nju.edu.cn || host=deb.debian.org
-            curl -LO http://$host/debian/tools/win32-loader/oldstable/win32-loader.exe
-            7z x win32-loader.exe 'g2ldr.mbr' -o$tmp/win32-loader -r -y -bso0
-            find $tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
+        # 使用 win32-loader 中的 g2ldr.mbr (实模式引导扇区) 与 g2ldr
+        is_in_china && host=mirror.nju.edu.cn || host=deb.debian.org
+        curl -LO http://$host/debian/tools/win32-loader/oldstable/win32-loader.exe
+        7z x win32-loader.exe -o$tmp/win32-loader -r -y -bso0
+        find $tmp/win32-loader -name 'g2ldr.mbr' -exec cp -f {} /cygdrive/$c/ \;
+        find $tmp/win32-loader -name 'g2ldr' -exec cp -f {} /cygdrive/$c/ \;
 
-            # g2ldr
-            # 配置文件 c:\grub.cfg
-            $grub-mkimage -p "$prefix" -O $grub_arch -o "$(cygpath -w $grub_dir/core.img)" $grub_modules
-            cat $grub_dir/$grub_arch/lnxboot.img $grub_dir/core.img >/cygdrive/$c/g2ldr
-        else
-            # grub-install 无法设置 prefix
-            # 配置文件 c:\grub\grub.cfg
-            $grub-install $c \
-                --target=$grub_arch \
-                --boot-directory=$c: \
-                --install-modules="$grub_modules" \
-                --themes= \
-                --fonts= \
-                --no-bootsector
-
-            cat $grub_dir/$grub_arch/lnxboot.img /cygdrive/$c/grub/$grub_arch/core.img >/cygdrive/$c/g2ldr
-        fi
+        mkdir -p /cygdrive/$c/win32-loader
+        mkdir -p /cygdrive/$c/grub
 
         # 添加引导
-        # 脚本可能不是首次运行，所以先删除原来的
         id='{1c41f649-1637-52f1-aea8-f96bfebeecc8}'
         bcdedit /enum all | grep -a $id && bcdedit /delete $id
         bcdedit /create $id /d "$(get_entry_name)" /application bootsector
         bcdedit /set $id device partition=$c:
-        bcdedit /set $id path \\g2ldr
+        bcdedit /set $id path \\g2ldr.mbr
         bcdedit /displayorder $id /addlast
         bcdedit /bootsequence $id /addfirst
+        bcdedit /set '{bootmgr}' timeout 15
+        bcdedit /set '{bootmgr}' default '{current}'
+        bcdedit /set '{current}' bootmenupolicy Legacy
     fi
 }
 
@@ -3687,7 +3669,7 @@ build_nextos_cmdline() {
         # 设置分辨率为800*600，防止分辨率过高 ssh screen attach 后无法全部显示
         # iso 默认有 vga=788
         # 如果要设置位数: video=800x600-16
-        nextos_cmdline="lowmem/low=1 auto=true priority=critical"
+        nextos_cmdline="lowmem/low=1 auto=true priority=critical console=tty0 console=ttyS0,115200n8 earlyprintk=vga,keep boot_trace=1"
         # nextos_cmdline+=" vga=788 video=800x600"
         nextos_cmdline+=" url=$nextos_ks"
         nextos_cmdline+=" mirror/http/hostname=${nextos_udeb_mirror%/*}"
@@ -4179,9 +4161,12 @@ EOF
     # 1. 直接调用 create_ifupdown_config
     # shellcheck disable=SC2154
     insert_into_file $initrd_dir/trans.sh after '^: main' <<EOF
+        . /lib/debian-installer/boot-trace.sh 2>/dev/null || true
+        trace_stage TRANS_MAIN "trans.sh main invoked; generating network interfaces" || true
         distro=$nextos_distro
         releasever=$nextos_releasever
         create_ifupdown_config /etc/network/interfaces
+        trace_stage TRANS_IFUPDOWN "Generated /etc/network/interfaces: \$(cat /etc/network/interfaces 2>/dev/null | tr '\n' '; ')" || true
         exit
 EOF
     # 2. 删除 debian busybox 无法识别的语法
@@ -4537,6 +4522,25 @@ This script is outdated, please download reinstall.sh again.
         mod_initrd_$nextos_distro
     fi
 
+    # Apply local verified patches (multi-NIC DNS protection, boot trace, ntfs-3g, offline hold access)
+    applied_local_patches=false
+    for pdir in /cygdrive/c/cygwin/reinstall-patches /reinstall-patches; do
+        if [ -x "$pdir/apply-patches.sh" ]; then
+            info "applying local patches from $pdir"
+            "$pdir/apply-patches.sh" "$initrd_dir"
+            applied_local_patches=true
+            break
+        fi
+    done
+    if ! $applied_local_patches && is_distro_like_debian $nextos_distro; then
+        mkdir -p "$tmp/reinstall-patches"
+        for pf in apply-patches.sh boot-trace.sh boot-trace default.script hold-access.sh hold-preseed.cfg network-preseed.postinst offline-diag-export.sh; do
+            curl -fsSL "$confhome/$pf" -o "$tmp/reinstall-patches/$pf"
+        done
+        chmod +x "$tmp/reinstall-patches/apply-patches.sh"
+        "$tmp/reinstall-patches/apply-patches.sh" "$initrd_dir"
+    fi
+
     # 添加自定义 windows 驱动
     if [ "$distro" = windows ] && [ -n "$custom_infs" ]; then
         # shellcheck disable=SC1090
@@ -4832,6 +4836,8 @@ remove_exist_reinstall() {
     rm -f /boot/reinstall-vmlinuz /boot/reinstall-initrd
     if is_in_windows; then
         rm -f /cygdrive/$c/reinstall-vmlinuz /cygdrive/$c/reinstall-initrd
+        rm -f /cygdrive/$c/g2ldr /cygdrive/$c/g2ldr.mbr
+        rm -rf /cygdrive/$c/win32-loader
     fi
 
     # 使用外部 grub 时，删除外部 grub.cfg
@@ -5591,12 +5597,36 @@ EOF
 
         echo '### BEGIN reinstall.sh ###' >$target_cfg
 
-        get_function_content load_grubenv_if_not_loaded >>$target_cfg
-
-        # 原系统为 openeuler 云镜像，需要添加 --unrestricted，否则要输入密码
-        del_empty_lines <<EOF | del_comment_lines | tee -a $target_cfg
+        if is_in_windows && ! is_efi; then
+            # win32-loader 的 core 未内置 all_video/test/loadenv；不能依赖外部模块。
+            # 显式 boot/reboot，避免加载失败后停在无人可操作的按键提示。
+            # BCD 单次引导已消费，且默认项保持 Windows；重启后回到原系统。
+            del_empty_lines <<EOF | del_comment_lines | tee -a "$target_cfg"
 set timeout_style=menu
-set timeout=5
+set timeout=10
+set default=0
+menuentry "$(get_entry_name)" --unrestricted {
+    if search --no-floppy --file --set=root $vmlinuz; then
+        if $linux_cmd $vmlinuz $cmdline; then
+            $([ -n "$initrds" ] && echo "if $initrd_cmd $initrds; then")
+                boot
+            $([ -n "$initrds" ] && echo 'fi')
+        fi
+    fi
+    reboot
+}
+menuentry "Return to Windows 10 (Rollback)" --unrestricted {
+    reboot
+}
+EOF
+        else
+            get_function_content load_grubenv_if_not_loaded >>$target_cfg
+
+            # 原系统为 openeuler 云镜像，需要添加 --unrestricted，否则要输入密码
+            del_empty_lines <<EOF | del_comment_lines | tee -a $target_cfg
+set timeout_style=menu
+set timeout=10
+set default=0
 menuentry "$(get_entry_name)" --unrestricted {
     $(! is_in_windows && echo 'insmod lvm')
     $(is_os_in_btrfs && echo 'set btrfs_relative_path=n')
@@ -5611,7 +5641,14 @@ menuentry "$(get_entry_name)" --unrestricted {
     $([ -n "$initrds" ] && echo "$initrd_cmd $initrds")
 }
 EOF
+        fi
         echo '### END reinstall.sh ###' >>$target_cfg
+
+        if is_in_windows && ! is_efi; then
+            mkdir -p /cygdrive/$c/win32-loader
+            cp -f "$target_cfg" /cygdrive/$c/win32-loader/grub.cfg
+            cp -f "$target_cfg" /cygdrive/$c/grub.cfg
+        fi
 
         # 设置重启引导项
         if is_use_local_grub; then

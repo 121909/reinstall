@@ -141,12 +141,20 @@ is_have_ipv6() {
     is_have_ipv6_addr && is_have_ipv6_gateway
 }
 
+is_have_explicit_ipv6_config() {
+    [ -n "$ipv6_addr" ] && [ -n "$ipv6_gateway" ] || return 1
+    ip -6 -o addr show scope global dev "$ethx" |
+        grep -Fq "inet6 $ipv6_addr " || return 1
+    ip -6 route show default dev "$ethx" |
+        grep -Fq " via $ipv6_gateway "
+}
+
 is_have_ipv4_dns() {
-    [ -f /etc/resolv.conf ] && grep -q '^nameserver .*\.' /etc/resolv.conf
+    [ -f /etc/resolv.conf ] && grep -qE '^[[:space:]]*nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/resolv.conf
 }
 
 is_have_ipv6_dns() {
-    [ -f /etc/resolv.conf ] && grep -q '^nameserver .*:' /etc/resolv.conf
+    [ -f /etc/resolv.conf ] && grep -qE '^[[:space:]]*nameserver[[:space:]]+[0-9a-fA-F:]*:[0-9a-fA-F:]*' /etc/resolv.conf
 }
 
 add_missing_ipv4_config() {
@@ -362,6 +370,7 @@ test_internet() {
             { test_internet_inner "$current_ipv4_addr" "$ipv4_dst1" ||
                 test_internet_inner "$current_ipv4_addr" "$ipv4_dst2"; } >/dev/null 2>&1; then
             ipv4_has_internet=true
+            mkdir -p "/dev/netconf/$ethx" && echo 1 >"/dev/netconf/$ethx/ipv4_has_internet"
             if [ "$mode" = "full" ]; then
                 ipv4_has_internet_with_dns=true
             fi
@@ -372,6 +381,7 @@ test_internet() {
             { test_internet_inner "$current_ipv6_addr" "$ipv6_dst1" ||
                 test_internet_inner "$current_ipv6_addr" "$ipv6_dst2"; } >/dev/null 2>&1; then
             ipv6_has_internet=true
+            mkdir -p "/dev/netconf/$ethx" && echo 1 >"/dev/netconf/$ethx/ipv6_has_internet"
             if [ "$mode" = "full" ]; then
                 ipv6_has_internet_with_dns=true
             fi
@@ -384,25 +394,322 @@ test_internet() {
     done
 }
 
+is_other_ipv4_has_internet() {
+    for dev_dir in /dev/netconf/*; do
+        if [ -d "$dev_dir" ] && [ "${dev_dir##*/}" != "$ethx" ]; then
+            if [ -f "$dev_dir/ipv4_has_internet" ] && [ "$(cat "$dev_dir/ipv4_has_internet" 2>/dev/null)" = "1" ]; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+is_other_ipv6_has_internet() {
+    for dev_dir in /dev/netconf/*; do
+        if [ -d "$dev_dir" ] && [ "${dev_dir##*/}" != "$ethx" ]; then
+            if [ -f "$dev_dir/ipv6_has_internet" ] && [ "$(cat "$dev_dir/ipv6_has_internet" 2>/dev/null)" = "1" ]; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+is_dns_used_by_active_other_eth() {
+    target_ip="$1"
+    for other_dir in /dev/netconf/*; do
+        if [ -d "$other_dir" ] && [ "${other_dir##*/}" != "$ethx" ]; then
+            has_net=0
+            if [ -f "$other_dir/ipv4_has_internet" ] && [ "$(cat "$other_dir/ipv4_has_internet" 2>/dev/null)" = "1" ]; then
+                has_net=1
+            fi
+            if [ -f "$other_dir/ipv6_has_internet" ] && [ "$(cat "$other_dir/ipv6_has_internet" 2>/dev/null)" = "1" ]; then
+                has_net=1
+            fi
+            if [ "$has_net" = "1" ]; then
+                for dns_file in "$other_dir/ipv4_dns" "$other_dir/ipv6_dns"; do
+                    if [ -f "$dns_file" ]; then
+                        while IFS= read -r recorded_dns || [ -n "$recorded_dns" ]; do
+                            if [ "$recorded_dns" = "$target_ip" ]; then
+                                return 0
+                            fi
+                        done <"$dns_file"
+                    fi
+                done
+            fi
+        fi
+    done
+    return 1
+}
+
+record_dhcp_dns() {
+    mkdir -p "/dev/netconf/$ethx"
+    if [ -f /etc/resolv.conf ]; then
+        while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+            set -f
+            set -- $raw_line
+            set +f
+            if [ "$1" = "nameserver" ] && [ -n "$2" ]; then
+                ns="$2"
+                case "$ns" in
+                *.*)
+                    is_before=0
+                    if [ -f "$resolv_conf_before" ]; then
+                        while IFS= read -r bline || [ -n "$bline" ]; do
+                            set -f
+                            set -- $bline
+                            set +f
+                            if [ "$1" = "nameserver" ] && [ "$2" = "$ns" ]; then
+                                is_before=1
+                                break
+                            fi
+                        done <"$resolv_conf_before"
+                    fi
+                    if [ "$is_before" = "0" ]; then
+                        echo "$ns" >>"/dev/netconf/$ethx/ipv4_dns"
+                    fi
+                    ;;
+                *:*)
+                    is_before=0
+                    if [ -f "$resolv_conf_before" ]; then
+                        while IFS= read -r bline || [ -n "$bline" ]; do
+                            set -f
+                            set -- $bline
+                            set +f
+                            if [ "$1" = "nameserver" ] && [ "$2" = "$ns" ]; then
+                                is_before=1
+                                break
+                            fi
+                        done <"$resolv_conf_before"
+                    fi
+                    if [ "$is_before" = "0" ]; then
+                        echo "$ns" >>"/dev/netconf/$ethx/ipv6_dns"
+                    fi
+                    ;;
+                esac
+            fi
+        done </etc/resolv.conf
+        [ -f "/dev/netconf/$ethx/ipv4_dns" ] && sort -u -o "/dev/netconf/$ethx/ipv4_dns" "/dev/netconf/$ethx/ipv4_dns"
+        [ -f "/dev/netconf/$ethx/ipv6_dns" ] && sort -u -o "/dev/netconf/$ethx/ipv6_dns" "/dev/netconf/$ethx/ipv6_dns"
+    fi
+}
+
+filter_resolv_conf_remove_v4() {
+    target_list_file="$1"
+    tmp_out="/etc/resolv.conf.tmp.$$"
+    > "$tmp_out"
+
+    if [ -f /etc/resolv.conf ]; then
+        while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+            set -f
+            set -- $raw_line
+            set +f
+            if [ "$1" = "nameserver" ] && [ -n "$2" ]; then
+                cand_ip="$2"
+                case "$cand_ip" in
+                *.*)
+                    del=0
+                    if [ -n "$target_list_file" ] && [ -f "$target_list_file" ]; then
+                        while IFS= read -r tip || [ -n "$tip" ]; do
+                            if [ "$cand_ip" = "$tip" ]; then
+                                del=1
+                                break
+                            fi
+                        done <"$target_list_file"
+                    elif [ -z "$target_list_file" ]; then
+                        del=1
+                    fi
+
+                    if [ "$del" = "1" ] && is_dns_used_by_active_other_eth "$cand_ip"; then
+                        del=0
+                    fi
+
+                    if [ "$del" = "0" ]; then
+                        echo "$raw_line" >>"$tmp_out"
+                    fi
+                    ;;
+                *)
+                    echo "$raw_line" >>"$tmp_out"
+                    ;;
+                esac
+            else
+                echo "$raw_line" >>"$tmp_out"
+            fi
+        done </etc/resolv.conf
+        mv -f "$tmp_out" /etc/resolv.conf
+    fi
+}
+
+filter_resolv_conf_remove_v6() {
+    target_list_file="$1"
+    tmp_out="/etc/resolv.conf.tmp.$$"
+    > "$tmp_out"
+
+    if [ -f /etc/resolv.conf ]; then
+        while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+            set -f
+            set -- $raw_line
+            set +f
+            if [ "$1" = "nameserver" ] && [ -n "$2" ]; then
+                cand_ip="$2"
+                case "$cand_ip" in
+                *:*)
+                    del=0
+                    if [ -n "$target_list_file" ] && [ -f "$target_list_file" ]; then
+                        while IFS= read -r tip || [ -n "$tip" ]; do
+                            if [ "$cand_ip" = "$tip" ]; then
+                                del=1
+                                break
+                            fi
+                        done <"$target_list_file"
+                    elif [ -z "$target_list_file" ]; then
+                        del=1
+                    fi
+
+                    if [ "$del" = "1" ] && is_dns_used_by_active_other_eth "$cand_ip"; then
+                        del=0
+                    fi
+
+                    if [ "$del" = "0" ]; then
+                        echo "$raw_line" >>"$tmp_out"
+                    fi
+                    ;;
+                *)
+                    echo "$raw_line" >>"$tmp_out"
+                    ;;
+                esac
+            else
+                echo "$raw_line" >>"$tmp_out"
+            fi
+        done </etc/resolv.conf
+        mv -f "$tmp_out" /etc/resolv.conf
+    fi
+}
+
 flush_ipv4_dns() {
-    sed -i "/\./d" /etc/resolv.conf
+    if is_other_ipv4_has_internet; then
+        log "Other interface already has working IPv4 internet. Preserving other interface IPv4 DNS."
+        if [ -f "/dev/netconf/$ethx/ipv4_dns" ]; then
+            filter_resolv_conf_remove_v4 "/dev/netconf/$ethx/ipv4_dns"
+            rm -f "/dev/netconf/$ethx/ipv4_dns"
+        fi
+        if [ -f "$resolv_conf_before" ]; then
+            while IFS= read -r raw_bline || [ -n "$raw_bline" ]; do
+                set -f
+                set -- $raw_bline
+                set +f
+                if [ "$1" = "nameserver" ] && [ -n "$2" ]; then
+                    case "$2" in
+                    *.*)
+                        escaped_ip=$(echo "$2" | sed 's/\./\\./g')
+                        if ! grep -qE "^[[:space:]]*nameserver[[:space:]]+$escaped_ip([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+                            echo "nameserver $2" >>/etc/resolv.conf
+                        fi
+                        ;;
+                    esac
+                fi
+            done <"$resolv_conf_before"
+        fi
+    else
+        if [ -f "/dev/netconf/$ethx/ipv4_dns" ]; then
+            filter_resolv_conf_remove_v4 "/dev/netconf/$ethx/ipv4_dns"
+            rm -f "/dev/netconf/$ethx/ipv4_dns"
+        fi
+        filter_resolv_conf_remove_v4 ""
+    fi
 }
 
 flush_ipv6_dns() {
-    sed -i "/:/d" /etc/resolv.conf
+    if is_other_ipv6_has_internet; then
+        log "Other interface already has working IPv6 internet. Preserving other interface IPv6 DNS."
+        if [ -f "/dev/netconf/$ethx/ipv6_dns" ]; then
+            filter_resolv_conf_remove_v6 "/dev/netconf/$ethx/ipv6_dns"
+            rm -f "/dev/netconf/$ethx/ipv6_dns"
+        fi
+        if [ -f "$resolv_conf_before" ]; then
+            while IFS= read -r raw_bline || [ -n "$raw_bline" ]; do
+                set -f
+                set -- $raw_bline
+                set +f
+                if [ "$1" = "nameserver" ] && [ -n "$2" ]; then
+                    case "$2" in
+                    *:*)
+                        if ! grep -qE "^[[:space:]]*nameserver[[:space:]]+$2([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+                            echo "nameserver $2" >>/etc/resolv.conf
+                        fi
+                        ;;
+                    esac
+                fi
+            done <"$resolv_conf_before"
+        fi
+    else
+        if [ -f "/dev/netconf/$ethx/ipv6_dns" ]; then
+            filter_resolv_conf_remove_v6 "/dev/netconf/$ethx/ipv6_dns"
+            rm -f "/dev/netconf/$ethx/ipv6_dns"
+        fi
+        filter_resolv_conf_remove_v6 ""
+    fi
 }
 
 should_add_ipv4_static_dns=false
 should_add_ipv6_static_dns=false
 
 add_ipv4_static_dns() {
-    echo "nameserver $ipv4_dns1" >>/etc/resolv.conf
-    echo "nameserver $ipv4_dns2" >>/etc/resolv.conf
+    mkdir -p "/dev/netconf/$ethx"
+    for dns in "$ipv4_dns1" "$ipv4_dns2"; do
+        if [ -n "$dns" ]; then
+            escaped_dns=$(echo "$dns" | sed 's/\./\\./g')
+            if ! [ -f /etc/resolv.conf ] || ! grep -qE "^[[:space:]]*nameserver[[:space:]]+$escaped_dns([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+                echo "nameserver $dns" >>/etc/resolv.conf
+            fi
+            echo "$dns" >>"/dev/netconf/$ethx/ipv4_dns"
+        fi
+    done
+    [ -f "/dev/netconf/$ethx/ipv4_dns" ] && sort -u -o "/dev/netconf/$ethx/ipv4_dns" "/dev/netconf/$ethx/ipv4_dns"
 }
 
 add_ipv6_static_dns() {
-    echo "nameserver $ipv6_dns1" >>/etc/resolv.conf
-    echo "nameserver $ipv6_dns2" >>/etc/resolv.conf
+    mkdir -p "/dev/netconf/$ethx"
+    for dns in "$ipv6_dns1" "$ipv6_dns2"; do
+        if [ -n "$dns" ]; then
+            if ! [ -f /etc/resolv.conf ] || ! grep -qE "^[[:space:]]*nameserver[[:space:]]+$dns([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+                echo "nameserver $dns" >>/etc/resolv.conf
+            fi
+            echo "$dns" >>"/dev/netconf/$ethx/ipv6_dns"
+        fi
+    done
+    [ -f "/dev/netconf/$ethx/ipv6_dns" ] && sort -u -o "/dev/netconf/$ethx/ipv6_dns" "/dev/netconf/$ethx/ipv6_dns"
+}
+
+sync_active_dns() {
+    for dev_dir in /dev/netconf/*; do
+        if [ -d "$dev_dir" ]; then
+            if [ -f "$dev_dir/ipv4_has_internet" ] && [ "$(cat "$dev_dir/ipv4_has_internet" 2>/dev/null)" = "1" ]; then
+                if [ -f "$dev_dir/ipv4_dns" ]; then
+                    while IFS= read -r dns || [ -n "$dns" ]; do
+                        if [ -n "$dns" ]; then
+                            escaped_dns=$(echo "$dns" | sed 's/\./\\./g')
+                            if ! grep -qE "^[[:space:]]*nameserver[[:space:]]+$escaped_dns([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+                                echo "nameserver $dns" >>/etc/resolv.conf
+                            fi
+                        fi
+                    done <"$dev_dir/ipv4_dns"
+                fi
+            fi
+            if [ -f "$dev_dir/ipv6_has_internet" ] && [ "$(cat "$dev_dir/ipv6_has_internet" 2>/dev/null)" = "1" ]; then
+                if [ -f "$dev_dir/ipv6_dns" ]; then
+                    while IFS= read -r dns || [ -n "$dns" ]; do
+                        if [ -n "$dns" ]; then
+                            if ! grep -qE "^[[:space:]]*nameserver[[:space:]]+$dns([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+                                echo "nameserver $dns" >>/etc/resolv.conf
+                            fi
+                        fi
+                    done <"$dev_dir/ipv6_dns"
+                fi
+            fi
+        fi
+    done
 }
 
 flush_ipv4_config() {
@@ -442,6 +749,13 @@ if [ -z "$ethx" ]; then
 fi
 
 log "Configuring $ethx ($mac_addr)..."
+mkdir -p "/dev/netconf/$ethx"
+resolv_conf_before="/dev/netconf/$ethx/resolv.conf.before"
+if [ -f /etc/resolv.conf ]; then
+    cp -f /etc/resolv.conf "$resolv_conf_before"
+else
+    : >"$resolv_conf_before"
+fi
 
 # 不开启 lo 则 frp 无法连接 127.0.0.1 22
 ip link set dev lo up
@@ -528,6 +842,7 @@ else
     esac
 fi
 
+record_dhcp_dns
 # 等待slaac
 # 有ipv6地址就跳过，不管是slaac或者dhcpv6
 # 因为会在trans里判断
@@ -604,22 +919,30 @@ fi
 #   此时alpine只会用ipv6下载apk，而不用会ipv4下载
 # 2 有ipv4地址但没有ipv4网关的情况(vultr $2.5 ipv6 only)，aria2会用ipv4下载
 
-# 假设 ipv4 ipv6 在不同网卡，ipv4 能上网但 ipv6 不能上网，这时也要删除 ipv6
-# 不能用 ipv4_has_internet && ! ipv6_has_internet 判断，因为它判断的是同一个网卡
+# 未显式指定完整静态配置的 IPv6 仍按公网探针结果清理；
+# 显式地址/网关还可用于私网，不以公网不可达判定它无用。
 if ! $ipv4_has_internet; then
     if $dhcpv4; then
         should_disable_dhcpv4=true
     fi
     flush_ipv4_config
 fi
+preserve_static_ipv6=false
 if ! $ipv6_has_internet; then
-    # 防止删除 IPv6 后再次通过 SLAAC 获得
-    # 不用判断 || $ra_has_gateway ，因为没有 IPv6 地址但有 IPv6 网关时，不会出现下载问题
-    if $dhcpv6_or_slaac; then
-        should_disable_accept_ra=true
-        should_disable_autoconf=true
+    if is_have_explicit_ipv6_config; then
+        preserve_static_ipv6=true
+        log "Preserving explicit IPv6 address/gateway without IPv6 internet."
+        # 只保留地址和路由，不保留未验证的互联网 DNS。
+        flush_ipv6_dns
+    else
+        # 防止删除 IPv6 后再次通过 SLAAC 获得
+        # 不用判断 || $ra_has_gateway ，因为没有 IPv6 地址但有 IPv6 网关时，不会出现下载问题
+        if $dhcpv6_or_slaac; then
+            should_disable_accept_ra=true
+            should_disable_autoconf=true
+        fi
+        flush_ipv6_config
     fi
-    flush_ipv6_config
 fi
 
 # 模拟无法获取 DNS
@@ -681,6 +1004,7 @@ for conf in \
     should_disable_autoconf \
     should_add_ipv4_static_dns \
     should_add_ipv6_static_dns \
+    preserve_static_ipv6 \
     ipv4_has_internet \
     ipv6_has_internet; do
     { eval \$$conf && echo 1 || echo 0; } >"/dev/netconf/$ethx/$conf"
@@ -696,6 +1020,7 @@ for conf in \
     ipv6_extra_addrs; do
     eval echo \"\$$conf\" >"/dev/netconf/$ethx/$conf"
 done
+sync_active_dns
 
 # 模拟下载失败
 # : >/etc/resolv.conf

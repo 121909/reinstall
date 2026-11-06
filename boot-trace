@@ -1,0 +1,4 @@
+#!/bin/sh
+# /usr/bin/boot-trace executable wrapper
+. /lib/debian-installer/boot-trace.sh
+trace_stage "$@"

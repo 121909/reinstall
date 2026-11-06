@@ -1,0 +1,45 @@
+#!/bin/sh
+set -e
+
+. /usr/share/debconf/confmodule
+
+# Offline hold must take precedence over DHCP/command-line remote preseeding.
+# Any explicit hold=1 wins; no kernel argument is evaluated as shell code.
+if grep -qE '(^|[[:space:]])(hold|extra_hold)=1([[:space:]]|$)' /proc/cmdline 2>/dev/null; then
+	# These are defence-in-depth settings, not the safety barrier.  Even if
+	# debconf or the local seed is unavailable, do not return to main-menu.
+	if ! debconf-set-selections /usr/lib/debian-installer/hold-preseed.cfg >/dev/null 2>&1; then
+		logger -t hold-access 'Local hold preseed unavailable; installer remains paused' || true
+	fi
+	db_set auto-install/enable false || true
+	db_set debconf/priority low || true
+	mkdir -p /var/run || true
+	printf '0\n' >/var/run/auto-install.active || true
+	logger -t hold-access 'Offline hold active: remote preseed skipped; automatic installation blocked' || true
+	# No remote preseed/early_command (and no second sshd/frpc launch).  Stay
+	# inside this component so a normal menu "continue" cannot reach partman.
+	# SIGINT/TERM/HUP do not release hold.  This boot has no release file/API;
+	# an operator with a root shell can of course deliberately override it.
+	trap '' HUP INT TERM QUIT
+ # Do not send debconf STOP: the frontend would advance after this postinst.
+ # Keep the component and its cdebconf descriptors alive until deliberate exit.
+	while :; do
+		sleep 3600 || true
+	done
+fi
+
+# Baseline: C:/cygwin/reinstall-tmp/initrd/var/lib/dpkg/info/network-preseed.postinst
+# (330-byte image source).  Non-hold execution below is unchanged.
+. /lib/preseed/preseed.sh
+
+# Re-enable locale and kbd selection
+echo 0 >/var/run/auto-install.active
+
+/lib/preseed/auto-install.sh
+
+dhcp_url=$(dhcp_preseed_url)
+if [ -n "$dhcp_url" ]; then
+	preseed_location "$dhcp_url"
+fi
+preseed preseed/url
+preseed_command preseed/early_command
